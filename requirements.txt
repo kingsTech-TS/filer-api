@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+cloudconvert==1.0.0
+python-multipart
+requests
+python-dotenv
