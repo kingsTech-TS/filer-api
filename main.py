@@ -15,10 +15,13 @@ MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", 20))
 
 app = FastAPI(title="Real-Time File Converter API")
 
-# CORS for local frontend
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # frontend origin
+    allow_origins=[
+        "http://localhost:3000", 
+        "https://filer-flame.vercel.app/"  # <-- Add your deployed frontend
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,7 +34,7 @@ OUTPUT_DIR = Path("outputs")
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-jobs = {}  # Simple in-memory store for demo
+jobs = {}  # In-memory store for demo
 ALLOWED_EXTENSIONS = {"pdf", "docx", "doc", "png", "jpg", "jpeg", "mp4", "mp3"}
 
 # ---------------- FILE VALIDATION ----------------
@@ -58,23 +61,23 @@ async def convert_file(
 ):
     validate_file(file)
 
+    # Save uploaded file
     input_path = UPLOAD_DIR / file.filename
     with open(input_path, "wb") as f:
         f.write(await file.read())
 
-    webhook_url = "https://your-domain.com/webhook/cloudconvert"  # Optional
-
+    # Start conversion job
+    webhook_url = "https://filer-api.onrender.com/webhook/cloudconvert"
     job_id = service.create_job(input_path, output_format, webhook_url)
 
+    # Save job in-memory
     jobs[job_id] = {
         "status": "processing",
+        "progress": 0,
         "filename": file.filename
     }
 
-    return {
-        "job_id": job_id,
-        "status": "processing"
-    }
+    return {"job_id": job_id, "status": "processing"}
 
 # ---------------- PROGRESS ----------------
 @app.get("/progress/{job_id}")
@@ -82,20 +85,22 @@ def get_progress(job_id: str):
     job = jobs.get(job_id)
     if not job:
         return JSONResponse(status_code=404, content={"error": "Job not found"})
+    
+    return {"status": job["status"], "progress": job.get("progress", 0)}
 
-    status = job.get("status", "processing")
-    progress = job.get("progress", 50)  # fallback for demo
-
-    return {"status": status, "progress": progress}
-
-# ---------------- WEBHOOK (REAL-TIME) ----------------
+# ---------------- WEBHOOK ----------------
 @app.post("/webhook/cloudconvert")
 async def cloudconvert_webhook(request: Request):
     payload = await request.json()
 
-    if payload.get("event") == "job.finished":
-        job_id = payload["job"]["id"]
+    job_id = payload.get("job", {}).get("id")
+    if not job_id or job_id not in jobs:
+        return JSONResponse(status_code=400, content={"error": "Unknown job"})
 
+    event = payload.get("event")
+    
+    if event == "job.finished":
+        # Download converted file
         url, filename = service.extract_download_url(payload["job"])
         response = requests.get(url)
 
@@ -104,11 +109,18 @@ async def cloudconvert_webhook(request: Request):
             f.write(response.content)
 
         jobs[job_id]["status"] = "finished"
+        jobs[job_id]["progress"] = 100
         jobs[job_id]["output"] = str(output_path)
 
-    if payload.get("event") == "job.failed":
-        job_id = payload["job"]["id"]
+    elif event == "job.failed":
         jobs[job_id]["status"] = "failed"
+        jobs[job_id]["progress"] = 100
+
+    else:
+        # For progress updates
+        progress = payload.get("progress")
+        if progress is not None:
+            jobs[job_id]["progress"] = progress
 
     return {"ok": True}
 
@@ -116,11 +128,10 @@ async def cloudconvert_webhook(request: Request):
 @app.get("/download/{job_id}")
 def download(job_id: str):
     job = jobs.get(job_id)
-
-    if not job or job["status"] != "finished":
+    if not job or job.get("status") != "finished":
         raise HTTPException(status_code=404, detail="File not ready")
 
-    output_path = Path(job["output"])
+    output_path = Path(job.get("output", ""))
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
