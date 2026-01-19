@@ -47,12 +47,16 @@ def verify_signature(payload: bytes, signature_header: str):
     if not signature_header:
         raise HTTPException(status_code=403, detail="No signature header")
 
-    # CloudConvert usually sends: t=123456,v1=abcdef...
-    # You need to split it to get the v1 hash.
-    # Depending on CloudConvert implementation, this logic may vary slightly.
-    # Assuming standard HMAC Hex Digest here.
-    
+    # CloudConvert format: t=...,v1=...
+    # We need to extract the v1 signature and optionally check timestamp
     try:
+        parts = {k: v for k, v in [x.split("=") for x in signature_header.split(",")]}
+        signature = parts.get("v1")
+        # timestamp = parts.get("t") # We can check freshness if needed
+        
+        if not signature:
+             raise HTTPException(status_code=403, detail="Invalid signature header format")
+
         # Create the expected hash
         mac = hmac.new(
             WEBHOOK_SECRET.encode('utf-8'), 
@@ -61,12 +65,11 @@ def verify_signature(payload: bytes, signature_header: str):
         )
         expected_signature = mac.hexdigest()
         
-        # Simple comparison (CloudConvert implementation might require handling timestamps 't=')
-        # Refer to specific CloudConvert docs for exact string formatting if this fails
-        if not hmac.compare_digest(expected_signature, signature_header):
+        if not hmac.compare_digest(expected_signature, signature):
             raise HTTPException(status_code=403, detail="Invalid signature")
             
     except Exception as e:
+        # Catch parsing errors or any other issues
         raise HTTPException(status_code=403, detail=f"Signature verification failed: {str(e)}")
 
 # ---------------- FILE VALIDATION ----------------
@@ -99,9 +102,14 @@ async def convert_file(
         f.write(await file.read())
 
     # Start conversion job
-    # Ensure this URL is publicly accessible from the internet
-    webhook_url = "https://filer-api.onrender.com/webhook/cloudconvert"
-    job_id = service.create_job(input_path, output_format, webhook_url)
+    # Use environment variable for webhook URL if available
+    default_webhook = "https://filer-api.onrender.com/webhook/cloudconvert"
+    webhook_url = os.getenv("WEBHOOK_URL", default_webhook)
+    
+    try:
+        job_id = await service.create_job(input_path, output_format, webhook_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
 
     # Save job in-memory
     jobs[job_id] = {
@@ -123,17 +131,24 @@ def get_progress(job_id: str):
 
 # ---------------- WEBHOOK (UPDATED) ----------------
 @app.post("/webhook/cloudconvert")
-async def cloudconvert_webhook(request: Request, x_cloudconvert_signature: str = Header(None)):
+async def cloudconvert_webhook(request: Request):
     # 1. Read raw body for verification
     payload_bytes = await request.body()
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
     # 2. Verify Security
-    # Note: Check CloudConvert docs for the exact header name, it might be 'CloudConvert-Signature'
-    verify_signature(payload_bytes, x_cloudconvert_signature)
+    signature_header = request.headers.get("CloudConvert-Signature")
+    verify_signature(payload_bytes, signature_header)
 
     job_id = payload.get("job", {}).get("id")
-    if not job_id or job_id not in jobs:
+    if not job_id:
+         # Some events might not be job related or structure differs, return ok to ignore
+         return {"ok": True}
+
+    if job_id not in jobs:
         # Log this incident, as it might be an attack or an orphan job
         print(f"Received webhook for unknown job: {job_id}")
         return JSONResponse(status_code=200, content={"ok": True}) # Return 200 to stop retries
@@ -141,20 +156,24 @@ async def cloudconvert_webhook(request: Request, x_cloudconvert_signature: str =
     event = payload.get("event")
     
     if event == "job.finished":
-        # 3. Use Async HTTP Client (httpx) instead of requests
-        url, filename = service.extract_download_url(payload["job"])
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            response.raise_for_status() # Raise error if download failed
+        try:
+            url, filename = service.extract_download_url(payload["job"])
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url)
+                response.raise_for_status() # Raise error if download failed
 
-        output_path = OUTPUT_DIR / filename
-        with open(output_path, "wb") as f:
-            f.write(response.content)
+            output_path = OUTPUT_DIR / filename
+            with open(output_path, "wb") as f:
+                f.write(response.content)
 
-        jobs[job_id]["status"] = "finished"
-        jobs[job_id]["progress"] = 100
-        jobs[job_id]["output"] = str(output_path)
+            jobs[job_id]["status"] = "finished"
+            jobs[job_id]["progress"] = 100
+            jobs[job_id]["output"] = str(output_path)
+            
+        except Exception as e:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["message"] = f"Download failed: {str(e)}"
 
     elif event == "job.failed":
         jobs[job_id]["status"] = "failed"
@@ -163,9 +182,11 @@ async def cloudconvert_webhook(request: Request, x_cloudconvert_signature: str =
 
     else:
         # For progress updates or other events
-        progress = payload.get("progress")
-        if progress is not None:
-            jobs[job_id]["progress"] = progress
+        # Note: 'job.created' or 'task.finished' might also come here
+        # CloudConvert sends nested task events sometimes if configured.
+        # But top level job events have 'job' key.
+        # We assume top level events.
+        pass
 
     return {"ok": True}
 
