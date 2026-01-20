@@ -24,6 +24,7 @@ class CloudConvertService:
                         "convert": {
                             "operation": "convert",
                             "input": "upload",
+                            "input_format": input_path.suffix.lstrip(".").lower(),
                             "output_format": output_format
                         },
                         "export": {
