@@ -47,14 +47,20 @@ def verify_signature(payload: bytes, signature_header: str):
     if not signature_header:
         raise HTTPException(status_code=403, detail="No signature header")
 
-    # CloudConvert format: t=...,v1=...
+    # CloudConvert format: t=...,v1=... OR just the signature
     # We need to extract the v1 signature and optionally check timestamp
     try:
-        parts = {k: v for k, v in [x.split("=") for x in signature_header.split(",")]}
-        signature = parts.get("v1")
-        # timestamp = parts.get("t") # We can check freshness if needed
+        print(f"DEBUG: Received Signature Header: {signature_header}")
         
+        signature = None
+        if "=" in signature_header:
+            parts = {k: v for k, v in [x.split("=") for x in signature_header.split(",")]}
+            signature = parts.get("v1")
+        else:
+            signature = signature_header
+
         if not signature:
+             print("DEBUG: Could not extract signature from header")
              raise HTTPException(status_code=403, detail="Invalid signature header format")
 
         # Create the expected hash
@@ -64,6 +70,18 @@ def verify_signature(payload: bytes, signature_header: str):
             digestmod=hashlib.sha256
         )
         expected_signature = mac.hexdigest()
+        
+        print(f"DEBUG: Expected Signature: {expected_signature}")
+        print(f"DEBUG: WEBHOOK_SECRET (partial): {WEBHOOK_SECRET[:4]}...")
+
+        if not hmac.compare_digest(expected_signature, signature):
+            print("DEBUG: Signature mismatch")
+            raise HTTPException(status_code=403, detail="Invalid signature")
+            
+    except Exception as e:
+        print(f"DEBUG: Verification exception: {str(e)}")
+        # Catch parsing errors or any other issues
+        raise HTTPException(status_code=403, detail=f"Signature verification failed: {str(e)}")
         
         if not hmac.compare_digest(expected_signature, signature):
             raise HTTPException(status_code=403, detail="Invalid signature")
